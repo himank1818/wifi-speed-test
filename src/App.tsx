@@ -175,6 +175,21 @@ export default function App() {
 
   const displaySpeed = state.phase === 'idle' ? 0 : state.currentSpeed;
   const isDone = state.phase === 'done';
+  const hasError = state.phase === 'error';
+  const statusMessage =
+    state.phase === 'ping'
+      ? 'Measuring latency (ping)…'
+      : state.phase === 'download'
+        ? 'Measuring download speed…'
+        : state.phase === 'upload'
+          ? 'Measuring upload speed…'
+          : state.phase === 'done'
+            ? 'Speed test complete.'
+            : hasError
+              ? state.error || 'Speed test failed.'
+              : state.isOnline
+                ? 'Ready to start a speed test.'
+                : 'You are offline. Reconnect to run the speed test.';
 
   return (
     <LanguageProvider currentLang={currentLanguageInfo.code} currentLanguageInfo={currentLanguageInfo}>
@@ -386,6 +401,10 @@ export default function App() {
                 isRunning={state.isRunning}
               />
 
+              <p className="mt-4 text-sm text-slate-400 text-center" role="status" aria-live="polite">
+                {statusMessage}
+              </p>
+
               {/* Progress bar */}
               {state.isRunning && (
                 <div className="w-full max-w-md mt-6">
@@ -409,19 +428,27 @@ export default function App() {
                 </div>
               )}
 
+              {hasError && (
+                <div className="mt-6 w-full max-w-xl rounded-2xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-200">
+                  <p className="font-medium">Speed test could not complete.</p>
+                  <p className="mt-1 text-rose-100/90">{state.error}</p>
+                </div>
+              )}
+
               {/* Action buttons */}
               <div className="flex flex-col sm:flex-row items-center gap-4 mt-8">
                 {!state.isRunning && !isDone && (
                   <button
                     onClick={handleStart}
-                    className="btn-glow relative px-10 py-4 rounded-2xl bg-gradient-to-r from-[#00d4ff] to-[#00ff88] text-[#0a0e1a] font-bold text-lg tracking-wide shadow-[0_0_30px_rgba(0,212,255,0.4)]"
-                    aria-label={t('button.start')}
+                    disabled={!state.isOnline}
+                    className="btn-glow relative px-10 py-4 rounded-2xl bg-gradient-to-r from-[#00d4ff] to-[#00ff88] text-[#0a0e1a] font-bold text-lg tracking-wide shadow-[0_0_30px_rgba(0,212,255,0.4)] disabled:opacity-50 disabled:cursor-not-allowed"
+                    aria-label={hasError ? 'Retry speed test' : t('button.start')}
                   >
                     <span className="flex items-center gap-3">
                       <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
                         <path d="M8 5v14l11-7z" />
                       </svg>
-                      {t('button.start')}
+                      {hasError ? 'Retry Test' : t('button.start')}
                     </span>
                   </button>
                 )}
@@ -457,6 +484,11 @@ export default function App() {
                   </div>
                 )}
               </div>
+
+              <p className="mt-4 text-xs text-slate-500 text-center max-w-xl">
+                This is an approximate browser-based estimate from public test endpoints and device/network conditions.
+                It is not a certified ISP compliance measurement.
+              </p>
             </div>
           </article>
 

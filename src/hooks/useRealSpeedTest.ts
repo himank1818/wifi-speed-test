@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 
 export interface TestResult {
   id: string;
@@ -20,18 +20,9 @@ interface SpeedTestState {
   upload: number;
   jitter: number;
   isRunning: boolean;
+  isOnline: boolean;
   error?: string;
 }
-
-// Speedtest.net (Ookla) public server list endpoint
-const SPEEDTEST_SERVER_LIST = 'https://www.speedtest.net/api/js/servers?engine=js&limit=100';
-
-// LibreSpeed fallback servers
-const FALLBACK_SERVERS = [
-  'https://speedtest.librespeed.org',
-  'https://speedtest.newrelic.com',
-  'https://speedtest.i3d.net',
-];
 
 interface Server {
   id: string;
@@ -43,7 +34,18 @@ interface Server {
   distance?: number;
 }
 
-// Calculate distance using Haversine formula
+const SERVER_LIST_URL = 'https://backend.librespeed.org/servers';
+
+const FALLBACK_SERVERS: Server[] = [
+  { id: 'fallback-1', name: 'LibreSpeed (Global)', url: 'https://speedtest.librespeed.org', country: 'Global', lat: 0, lon: 0 },
+  { id: 'fallback-2', name: 'NewRelic', url: 'https://speedtest.newrelic.com', country: 'Global', lat: 0, lon: 0 },
+  { id: 'fallback-3', name: 'i3D.net', url: 'https://speedtest.i3d.net', country: 'Global', lat: 0, lon: 0 },
+];
+
+const PING_SAMPLES = 5;
+const DOWNLOAD_TEST_DURATION_MS = 7000;
+const UPLOAD_TEST_DURATION_MS = 7000;
+
 function calculateDistance(lat1: number, lon1: number, lat2: number, lon2: number): number {
   const R = 6371;
   const dLat = ((lat2 - lat1) * Math.PI) / 180;
@@ -58,129 +60,160 @@ function calculateDistance(lat1: number, lon1: number, lat2: number, lon2: numbe
   return R * c;
 }
 
-// Get user location
+function sanitizeMbps(value: number): number {
+  if (!Number.isFinite(value) || value < 0) return 0;
+  return Math.round(value * 10) / 10;
+}
+
+function getNetworkEstimate(): { downlink?: number; rtt?: number } {
+  const conn = (navigator as Navigator & { connection?: { downlink?: number; rtt?: number } }).connection;
+  if (!conn) return {};
+  return {
+    downlink: typeof conn.downlink === 'number' ? conn.downlink : undefined,
+    rtt: typeof conn.rtt === 'number' ? conn.rtt : undefined,
+  };
+}
+
+function normalizeServerUrl(rawUrl: string): string {
+  const trimmed = rawUrl.replace(/\/+$/, '');
+  return trimmed.replace(/\/(upload|empty|garbage)\.php$/i, '');
+}
+
+function computeJitter(samples: number[]): number {
+  if (samples.length < 2) return 0;
+  const mean = samples.reduce((sum, sample) => sum + sample, 0) / samples.length;
+  const variance = samples.reduce((sum, sample) => sum + Math.pow(sample - mean, 2), 0) / samples.length;
+  return Math.sqrt(variance);
+}
+
+async function timedFetch(
+  url: string,
+  init: RequestInit,
+  timeoutMs: number,
+  parentSignal?: AbortSignal
+): Promise<Response> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+  const abortFromParent = () => controller.abort();
+  parentSignal?.addEventListener('abort', abortFromParent, { once: true });
+  if (parentSignal?.aborted) {
+    controller.abort();
+  }
+
+  try {
+    return await fetch(url, {
+      ...init,
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timeoutId);
+    parentSignal?.removeEventListener('abort', abortFromParent);
+  }
+}
+
 async function getUserLocation(): Promise<{ lat: number; lon: number } | null> {
   return new Promise((resolve) => {
     if (!navigator.geolocation) {
       resolve(null);
       return;
     }
+
     navigator.geolocation.getCurrentPosition(
-      (pos) => resolve({ lat: pos.coords.latitude, lon: pos.coords.longitude }),
+      (position) => {
+        resolve({ lat: position.coords.latitude, lon: position.coords.longitude });
+      },
       () => resolve(null),
-      { timeout: 5000 }
+      { timeout: 5000, maximumAge: 300000 }
     );
   });
 }
 
-// Fetch Speedtest.net (Ookla) servers
-async function fetchServers(): Promise<Server[]> {
+async function fetchServers(signal?: AbortSignal): Promise<Server[]> {
   try {
-    // Try Speedtest.net API first
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 8000);
-    
-    const response = await fetch(SPEEDTEST_SERVER_LIST, { 
-      signal: controller.signal,
-      headers: {
-        'Accept': 'application/json',
-      }
-    });
-    clearTimeout(timeoutId);
-    
-    if (!response.ok) throw new Error('Failed to fetch Speedtest servers');
-    const servers = await response.json();
-    
-    // Parse Speedtest.net server format
-    return servers.slice(0, 50).map((s: any) => ({
-      id: s.id?.toString() || Math.random().toString(36).substr(2, 9),
-      name: s.sponsor || s.name || 'Speedtest Server',
-      url: s.url || `https://${s.host}`,
-      country: s.country || 'Unknown',
-      lat: parseFloat(s.lat) || 0,
-      lon: parseFloat(s.lon) || 0,
-    }));
-  } catch (error) {
-    console.warn('Speedtest.net API failed, using fallback servers:', error);
-    // Fallback to LibreSpeed servers
-    try {
-      const fallbackResponse = await fetch('https://backend.librespeed.org/servers', {
-        signal: new AbortController().signal,
-      });
-      const fallbackServers = await fallbackResponse.json();
-      return fallbackServers.slice(0, 20).map((s: any) => ({
-        id: s.id?.toString() || Math.random().toString(36).substr(2, 9),
-        name: s.name || 'LibreSpeed Server',
-        url: s.url || 'https://speedtest.librespeed.org',
-        country: s.country || 'Global',
-        lat: parseFloat(s.lat) || 0,
-        lon: parseFloat(s.lon) || 0,
-      }));
-    } catch {
-      // Last resort: hardcoded fallback
-      return [
-        { id: '1', name: 'Speedtest Global', url: 'https://speedtest.newrelic.com', country: 'Global', lat: 37.7749, lon: -122.4194 },
-        { id: '2', name: 'i3D.net', url: 'https://speedtest.i3d.net', country: 'Netherlands', lat: 52.3676, lon: 4.9041 },
-        { id: '3', name: 'LeaseWeb', url: 'https://speedtest.leaseweb.net', country: 'Germany', lat: 50.1109, lon: 8.6821 },
-      ];
-    }
+    const response = await timedFetch(SERVER_LIST_URL, { cache: 'no-store' }, 8000, signal);
+    if (!response.ok) throw new Error('Unable to fetch server list');
+
+    const data = (await response.json()) as Array<Record<string, unknown>>;
+    const parsed = data
+      .map((server) => {
+        const rawUrl = typeof server.url === 'string' ? server.url : '';
+        if (!rawUrl) return null;
+
+        const lat = Number(server.lat);
+        const lon = Number(server.lon);
+
+        return {
+          id: String(server.id ?? Math.random().toString(36).slice(2, 10)),
+          name: String(server.name ?? 'LibreSpeed Server'),
+          url: normalizeServerUrl(rawUrl),
+          country: String(server.country ?? 'Unknown'),
+          lat: Number.isFinite(lat) ? lat : 0,
+          lon: Number.isFinite(lon) ? lon : 0,
+        } as Server;
+      })
+      .filter((server): server is Server => Boolean(server));
+
+    return parsed.length > 0 ? parsed : FALLBACK_SERVERS;
+  } catch {
+    return FALLBACK_SERVERS;
   }
 }
 
-// Select nearest server
-async function selectNearestServer(): Promise<Server | null> {
-  const location = await getUserLocation();
-  const servers = await fetchServers();
+async function selectNearestServer(signal?: AbortSignal): Promise<Server> {
+  const [servers, location] = await Promise.all([fetchServers(signal), getUserLocation()]);
+  if (!location) return servers[0];
 
-  if (!location) {
-    return servers[0] || null;
-  }
-
-  // Calculate distances
-  const serversWithDistance = servers
-    .filter((s: Server) => s.lat && s.lon)
-    .map((s: Server) => ({
-      ...s,
-      distance: calculateDistance(location.lat, location.lon, s.lat, s.lon),
+  const withDistance = servers
+    .map((server) => ({
+      ...server,
+      distance: calculateDistance(location.lat, location.lon, server.lat, server.lon),
     }))
-    .sort((a: Server, b: Server) => (a.distance || 9999) - (b.distance || 9999));
+    .sort((a, b) => (a.distance ?? Number.POSITIVE_INFINITY) - (b.distance ?? Number.POSITIVE_INFINITY));
 
-  return serversWithDistance[0] || servers[0] || null;
+  return withDistance[0] ?? servers[0];
 }
 
-// Ping measurement - ULTRA FAST (3 attempts, ~0.5 seconds)
-async function measurePing(serverUrl: string): Promise<{ ping: number; jitter: number }> {
+async function measurePing(serverUrl: string, signal: AbortSignal): Promise<{ ping: number; jitter: number }> {
   const samples: number[] = [];
-  const attempts = 3; // Reduced from 6 for speed
 
-  for (let i = 0; i < attempts; i++) {
+  for (let i = 0; i < PING_SAMPLES; i++) {
+    if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
+
     const start = performance.now();
+    const pingUrl = `${serverUrl}/empty.php?x=${Date.now()}-${i}`;
+
     try {
-      const pingUrl = `${serverUrl}/backend/empty.png?t=${Date.now()}-${i}`;
-      await new Promise<void>((resolve) => {
-        const img = new Image();
-        img.onload = () => resolve();
-        img.onerror = () => resolve();
-        img.src = pingUrl;
-      });
+      await timedFetch(
+        pingUrl,
+        {
+          cache: 'no-store',
+          mode: 'cors',
+          method: 'GET',
+        },
+        3000,
+        signal
+      );
       const elapsed = performance.now() - start;
-      if (elapsed < 2000) {
+      if (elapsed > 0 && elapsed < 3000) {
         samples.push(elapsed);
       }
     } catch {
-      samples.push(30 + Math.random() * 30);
+      // Ignore failed sample and continue collecting others.
     }
   }
 
   if (samples.length === 0) {
-    return { ping: 30, jitter: 5 };
+    const estimate = getNetworkEstimate();
+    if (estimate.rtt) {
+      const roundedRtt = Math.round(estimate.rtt * 10) / 10;
+      return { ping: roundedRtt, jitter: 0 };
+    }
+    throw new Error('Could not measure latency from public test servers. Please check firewall/VPN settings and retry.');
   }
 
-  const sorted = samples.sort((a, b) => a - b);
-  const ping = sorted.reduce((a, b) => a + b, 0) / sorted.length;
-  const mean = ping;
-  const variance = sorted.reduce((sum, val) => sum + Math.pow(val - mean, 2), 0) / sorted.length;
-  const jitter = Math.sqrt(variance);
+  const ping = samples.reduce((sum, sample) => sum + sample, 0) / samples.length;
+  const jitter = computeJitter(samples);
 
   return {
     ping: Math.round(ping * 10) / 10,
@@ -188,106 +221,188 @@ async function measurePing(serverUrl: string): Promise<{ ping: number; jitter: n
   };
 }
 
-// Download speed - ULTRA FAST (1.5 seconds, simulation like Option A)
 async function measureDownload(
-  _serverUrl: string,
-  onProgress: (progress: number, speed: number) => void
+  serverUrl: string,
+  signal: AbortSignal,
+  onProgress: (progress: number, speedMbps: number) => void
 ): Promise<number> {
-  const speeds: number[] = [];
-  const totalSamples = 5;
-  const sizes = [512, 1024, 1024, 2048, 2048]; // KB
+  const startedAt = performance.now();
+  const finishedAt = startedAt + DOWNLOAD_TEST_DURATION_MS;
+  const chunkSizesKb = [512, 1024, 2048, 4096];
 
-  console.log('📥 Starting download test (FAST)...');
+  let totalBytes = 0;
+  let successfulSamples = 0;
+  const sampleSpeeds: number[] = [];
+  let chunkIndex = 0;
 
-  for (let i = 0; i < totalSamples; i++) {
-    const sizeKB = sizes[i];
-    const start = performance.now();
+  while (performance.now() < finishedAt) {
+    if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
 
-    // Simulate download (FAST - like Option A)
-    await new Promise<void>(resolve => {
-      const baseMbps = 20 + Math.random() * 60; // 20-80 Mbps
-      const jitter = 0.8 + Math.random() * 0.4;
-      const effectiveMbps = baseMbps * jitter;
-      const bits = sizeKB * 1024 * 8;
-      const duration = (bits / (effectiveMbps * 1_000_000)) * 1000;
-      const latency = 3 + Math.random() * 15;
-      setTimeout(resolve, duration + latency);
-    });
+    const sizeKb = chunkSizesKb[chunkIndex % chunkSizesKb.length];
+    chunkIndex += 1;
 
-    const elapsed = performance.now() - start;
-    const speedMbps = (sizeKB * 8 * 1000) / (elapsed * 1000);
-    speeds.push(speedMbps);
+    const requestUrl = `${serverUrl}/garbage.php?ckSize=${sizeKb}&r=${Math.random()}`;
+    const chunkStart = performance.now();
 
-    // Update progress
-    const recent = speeds.slice(-3);
-    const displaySpeed = recent.reduce((a, b) => a + b, 0) / recent.length;
-    const progress = 20 + ((i + 1) / totalSamples) * 40;
-    
-    onProgress(progress, displaySpeed);
-    console.log(`Download ${i + 1}/${totalSamples}: ${speedMbps.toFixed(1)} Mbps`);
+    try {
+      const response = await timedFetch(
+        requestUrl,
+        {
+          cache: 'no-store',
+          mode: 'cors',
+          method: 'GET',
+        },
+        8000,
+        signal
+      );
+
+      if (!response.ok || !response.body) {
+        throw new Error('Invalid download response');
+      }
+
+      const reader = response.body.getReader();
+      let chunkBytes = 0;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        chunkBytes += value.length;
+        totalBytes += value.length;
+
+        const elapsedMs = performance.now() - startedAt;
+        if (elapsedMs > 0) {
+          const currentMbps = (totalBytes * 8) / (elapsedMs / 1000) / 1_000_000;
+          const progress = Math.min((elapsedMs / DOWNLOAD_TEST_DURATION_MS) * 100, 100);
+          onProgress(progress, sanitizeMbps(currentMbps));
+        }
+
+        if (signal.aborted || performance.now() >= finishedAt) {
+          await reader.cancel();
+          break;
+        }
+      }
+
+      const chunkElapsedMs = performance.now() - chunkStart;
+      if (chunkBytes > 0 && chunkElapsedMs > 0) {
+        const chunkMbps = (chunkBytes * 8) / (chunkElapsedMs / 1000) / 1_000_000;
+        if (Number.isFinite(chunkMbps) && chunkMbps > 0) {
+          sampleSpeeds.push(chunkMbps);
+          successfulSamples += 1;
+        }
+      }
+    } catch {
+      // If one server request fails, continue; we'll fail only if all fail.
+    }
   }
 
-  // Calculate final speed
-  const sorted = [...speeds].sort((a, b) => a - b);
-  const trim = Math.floor(sorted.length * 0.15);
-  const trimmed = sorted.slice(trim, sorted.length - trim || sorted.length);
-  const avg = trimmed.length > 0
-    ? trimmed.reduce((a, b) => a + b, 0) / trimmed.length
-    : speeds.reduce((a, b) => a + b, 0) / speeds.length;
+  if (successfulSamples === 0 || totalBytes === 0) {
+    const estimate = getNetworkEstimate();
+    if (estimate.downlink) {
+      return sanitizeMbps(estimate.downlink);
+    }
+    throw new Error('Download test could not complete. Cross-origin requests may be blocked on this network.');
+  }
 
-  const finalSpeed = Math.round(avg * 10) / 10;
-  console.log('✅ Download complete:', finalSpeed, 'Mbps');
-  
-  return finalSpeed;
+  const elapsedSeconds = (performance.now() - startedAt) / 1000;
+  const averageMbps = (totalBytes * 8) / elapsedSeconds / 1_000_000;
+  const sampleMedian =
+    [...sampleSpeeds].sort((a, b) => a - b)[Math.floor(sampleSpeeds.length / 2)] ?? averageMbps;
+
+  return sanitizeMbps((averageMbps + sampleMedian) / 2);
 }
 
-// Upload speed - ULTRA FAST (1.5 seconds, GUARANTEED to work)
 async function measureUpload(
-  _serverUrl: string,
-  onProgress: (progress: number, speed: number) => void
+  serverUrl: string,
+  signal: AbortSignal,
+  onProgress: (progress: number, speedMbps: number) => void
 ): Promise<number> {
-  const speeds: number[] = [];
-  const totalSamples = 4; // Reduced from 6 for speed
-  const sizes = [256, 512, 1024, 1024]; // KB
+  const startedAt = performance.now();
+  const finishedAt = startedAt + UPLOAD_TEST_DURATION_MS;
+  const payloadSizes = [256 * 1024, 512 * 1024, 1024 * 1024];
 
-  console.log('📤 Starting upload test (FAST)...');
+  let totalBytes = 0;
+  let successfulSamples = 0;
+  const sampleSpeeds: number[] = [];
+  let payloadIndex = 0;
 
-  for (let i = 0; i < totalSamples; i++) {
-    const sizeKB = sizes[i];
-    const start = performance.now();
+  while (performance.now() < finishedAt) {
+    if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
 
-    // Simulate upload FAST
-    await new Promise<void>(resolve => {
-      const baseMbps = 10 + Math.random() * 30; // 10-40 Mbps
-      const jitter = 0.8 + Math.random() * 0.4;
-      const effectiveMbps = baseMbps * jitter;
-      const bits = sizeKB * 1024 * 8;
-      const duration = (bits / (effectiveMbps * 1_000_000)) * 1000;
-      const latency = 5 + Math.random() * 20;
-      setTimeout(resolve, duration + latency);
-    });
+    const payloadSize = payloadSizes[payloadIndex % payloadSizes.length];
+    payloadIndex += 1;
 
-    const elapsed = performance.now() - start;
-    const speedMbps = (sizeKB * 8 * 1000) / (elapsed * 1000);
-    speeds.push(speedMbps);
+    const payload = new Uint8Array(payloadSize);
+    const uploadBody = new Blob([payload], { type: 'text/plain' });
 
-    // Update progress FAST
-    const recent = speeds.slice(-2);
-    const displaySpeed = recent.reduce((a, b) => a + b, 0) / recent.length;
-    const progress = 60 + ((i + 1) / totalSamples) * 40;
-    
-    onProgress(progress, displaySpeed);
-    console.log(`Upload ${i + 1}/${totalSamples}: ${speedMbps.toFixed(1)} Mbps`);
+    const uploadStart = performance.now();
+
+    try {
+      await timedFetch(
+        `${serverUrl}/empty.php?r=${Math.random()}`,
+        {
+          method: 'POST',
+          mode: 'cors',
+          cache: 'no-store',
+          body: uploadBody,
+        },
+        8000,
+        signal
+      );
+
+      const elapsedMs = performance.now() - uploadStart;
+      if (elapsedMs > 0) {
+        totalBytes += payload.byteLength;
+        successfulSamples += 1;
+
+        const sampleMbps = (payload.byteLength * 8) / (elapsedMs / 1000) / 1_000_000;
+        if (Number.isFinite(sampleMbps) && sampleMbps > 0) {
+          sampleSpeeds.push(sampleMbps);
+        }
+
+        const overallElapsedMs = performance.now() - startedAt;
+        const currentMbps = (totalBytes * 8) / (overallElapsedMs / 1000) / 1_000_000;
+        const progress = Math.min((overallElapsedMs / UPLOAD_TEST_DURATION_MS) * 100, 100);
+        onProgress(progress, sanitizeMbps(currentMbps));
+      }
+    } catch {
+      // Continue trying while duration allows.
+    }
   }
 
-  // Calculate final speed
-  const sorted = [...speeds].sort((a, b) => a - b);
-  const avg = sorted.reduce((a, b) => a + b, 0) / sorted.length;
-  const finalSpeed = Math.round(avg * 10) / 10;
-  
-  console.log('✅ Upload complete:', finalSpeed, 'Mbps');
-  
-  return finalSpeed;
+  if (successfulSamples === 0 || totalBytes === 0) {
+    const estimate = getNetworkEstimate();
+    if (estimate.downlink) {
+      return sanitizeMbps(estimate.downlink * 0.3);
+    }
+    throw new Error('Upload test could not complete. Browser or network policy may block cross-origin uploads.');
+  }
+
+  const elapsedSeconds = (performance.now() - startedAt) / 1000;
+  const averageMbps = (totalBytes * 8) / elapsedSeconds / 1_000_000;
+  const sampleMedian = [...sampleSpeeds].sort((a, b) => a - b)[Math.floor(sampleSpeeds.length / 2)] ?? averageMbps;
+
+  return sanitizeMbps((averageMbps + sampleMedian) / 2);
+}
+
+function parseErrorMessage(error: unknown): string {
+  if (!navigator.onLine) {
+    return 'You appear to be offline. Reconnect to the internet and try again.';
+  }
+
+  if (error instanceof DOMException && error.name === 'AbortError') {
+    return 'Test cancelled.';
+  }
+
+  if (error instanceof TypeError) {
+    return 'Could not reach public speed test servers. Your browser, VPN, firewall, or network may be blocking cross-origin speed tests.';
+  }
+
+  if (error instanceof Error && error.message) {
+    return error.message;
+  }
+
+  return 'Speed test failed. Please retry in a few seconds.';
 }
 
 export function useRealSpeedTest() {
@@ -300,14 +415,48 @@ export function useRealSpeedTest() {
     upload: 0,
     jitter: 0,
     isRunning: false,
+    isOnline: navigator.onLine,
   });
 
   const cancelRef = useRef(false);
+  const runIdRef = useRef(0);
   const serverRef = useRef<Server | null>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
+
+  useEffect(() => {
+    const setOnline = () => {
+      setState((prev) => ({ ...prev, isOnline: true }));
+    };
+
+    const setOffline = () => {
+      abortControllerRef.current?.abort();
+      cancelRef.current = true;
+      setState((prev) => ({
+        ...prev,
+        isOnline: false,
+        isRunning: false,
+        phase: 'error',
+        error: 'You are offline. Reconnect to run the speed test.',
+      }));
+    };
+
+    window.addEventListener('online', setOnline);
+    window.addEventListener('offline', setOffline);
+
+    return () => {
+      window.removeEventListener('online', setOnline);
+      window.removeEventListener('offline', setOffline);
+      abortControllerRef.current?.abort();
+    };
+  }, []);
 
   const reset = useCallback(() => {
     cancelRef.current = true;
-    setState({
+    runIdRef.current += 1;
+    abortControllerRef.current?.abort();
+
+    setState((prev) => ({
+      ...prev,
       phase: 'idle',
       progress: 0,
       currentSpeed: 0,
@@ -316,13 +465,32 @@ export function useRealSpeedTest() {
       upload: 0,
       jitter: 0,
       isRunning: false,
-    });
+      error: undefined,
+    }));
   }, []);
 
   const startTest = useCallback(async () => {
-    cancelRef.current = false;
+    if (state.isRunning) return;
 
-    setState({
+    if (!navigator.onLine) {
+      setState((prev) => ({
+        ...prev,
+        phase: 'error',
+        isRunning: false,
+        error: 'You are offline. Reconnect to run the speed test.',
+      }));
+      return;
+    }
+
+    cancelRef.current = false;
+    const currentRunId = runIdRef.current + 1;
+    runIdRef.current = currentRunId;
+
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+
+    setState((prev) => ({
+      ...prev,
       phase: 'ping',
       progress: 0,
       currentSpeed: 0,
@@ -331,67 +499,83 @@ export function useRealSpeedTest() {
       upload: 0,
       jitter: 0,
       isRunning: true,
-    });
+      error: undefined,
+    }));
+
+    const isStale = () => cancelRef.current || runIdRef.current !== currentRunId;
 
     try {
-      // Use cached server or get new one
       if (!serverRef.current) {
-        serverRef.current = await selectNearestServer();
+        serverRef.current = await selectNearestServer(controller.signal);
       }
-      const serverUrl = serverRef.current?.url || FALLBACK_SERVERS[0];
 
-      // Phase 1: Ping (~0.5 seconds)
-      setState(s => ({ ...s, phase: 'ping', progress: 5 }));
-      const { ping, jitter } = await measurePing(serverUrl);
-      if (cancelRef.current) return;
-      setState(s => ({ ...s, ping, jitter, progress: 20 }));
+      if (isStale()) return;
+      const serverUrl = serverRef.current?.url ?? FALLBACK_SERVERS[0].url;
 
-      // Phase 2: Download (~1.5 seconds)
-      setState(s => ({ ...s, phase: 'download' }));
-      const download = await measureDownload(serverUrl, (progress, speed) => {
-        if (cancelRef.current) return;
-        setState(s => ({
-          ...s,
-          currentSpeed: speed,
-          progress: 20 + (progress * 0.4),
+      setState((prev) => ({ ...prev, phase: 'ping', progress: 5 }));
+      const { ping, jitter } = await measurePing(serverUrl, controller.signal);
+      if (isStale()) return;
+
+      setState((prev) => ({
+        ...prev,
+        ping: sanitizeMbps(ping),
+        jitter: sanitizeMbps(jitter),
+        progress: 20,
+      }));
+
+      setState((prev) => ({ ...prev, phase: 'download' }));
+      const download = await measureDownload(serverUrl, controller.signal, (progress, speed) => {
+        if (isStale()) return;
+        setState((prev) => ({
+          ...prev,
+          currentSpeed: sanitizeMbps(speed),
+          progress: 20 + progress * 0.4,
         }));
       });
-      if (cancelRef.current) return;
-      setState(s => ({ ...s, download, progress: 60 }));
 
-      // Phase 3: Upload (~1.5 seconds)
-      setState(s => ({ ...s, phase: 'upload' }));
-      const upload = await measureUpload(serverUrl, (progress, speed) => {
-        if (cancelRef.current) return;
-        setState(s => ({
-          ...s,
-          currentSpeed: speed,
-          progress: 60 + (progress * 0.4),
+      if (isStale()) return;
+
+      setState((prev) => ({
+        ...prev,
+        download: sanitizeMbps(download),
+        currentSpeed: sanitizeMbps(download),
+        progress: 60,
+      }));
+
+      setState((prev) => ({ ...prev, phase: 'upload' }));
+      const upload = await measureUpload(serverUrl, controller.signal, (progress, speed) => {
+        if (isStale()) return;
+        setState((prev) => ({
+          ...prev,
+          currentSpeed: sanitizeMbps(speed),
+          progress: 60 + progress * 0.4,
         }));
       });
-      if (cancelRef.current) return;
 
-      // Complete
-      setState(s => ({
-        ...s,
+      if (isStale()) return;
+
+      const safeDownload = sanitizeMbps(download);
+      const safeUpload = sanitizeMbps(upload);
+
+      setState((prev) => ({
+        ...prev,
         phase: 'done',
-        upload,
-        currentSpeed: download,
+        download: safeDownload,
+        upload: safeUpload,
+        currentSpeed: safeDownload,
         progress: 100,
         isRunning: false,
       }));
-      
-      // Play success chime
+
       import('../utils/audio').then(({ playSound }) => playSound.success());
 
-      // Save to history
       const result: TestResult = {
         id: Date.now().toString(),
         timestamp: Date.now(),
-        download,
-        upload,
-        ping,
-        jitter,
+        download: safeDownload,
+        upload: safeUpload,
+        ping: sanitizeMbps(ping),
+        jitter: sanitizeMbps(jitter),
       };
 
       const historyRaw = localStorage.getItem('speedtest-history');
@@ -399,25 +583,31 @@ export function useRealSpeedTest() {
       history.unshift(result);
       localStorage.setItem('speedtest-history', JSON.stringify(history.slice(0, 5)));
 
-      // Also send the result to the backend so it shows up in the admin panel's
-      // analytics. This is best-effort — if it fails, the test itself still
-      // succeeded for the visitor, so we only log the error.
       fetch('/api/results', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ download, upload, ping, jitter }),
+        body: JSON.stringify({
+          download: safeDownload,
+          upload: safeUpload,
+          ping: sanitizeMbps(ping),
+          jitter: sanitizeMbps(jitter),
+        }),
       }).catch((err) => console.warn('Could not save result to server:', err));
-
     } catch (error) {
-      console.error('Speed test error:', error);
-      setState(s => ({
-        ...s,
+      if (isStale()) return;
+
+      setState((prev) => ({
+        ...prev,
         phase: 'error',
         isRunning: false,
-        error: error instanceof Error ? error.message : 'Test failed',
+        error: parseErrorMessage(error),
       }));
+    } finally {
+      if (runIdRef.current === currentRunId) {
+        abortControllerRef.current = null;
+      }
     }
-  }, []);
+  }, [state.isRunning]);
 
   return { state, startTest, reset, selectedServer: serverRef.current };
 }
